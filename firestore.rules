@@ -1,0 +1,323 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net: Default-deny all undefined paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Common Hardened Security Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidRole(role) {
+      return role in [
+        'Administrator',
+        'Warehouse Operator',
+        'Ration Shop Dealer'
+      ];
+    }
+
+    // Trusted Bootstrap Administrative Identity
+    // Required to prevent self-escalation while bootstrapping the initial administrative authority
+    function isBootstrapAdmin() {
+      return isSignedIn() &&
+        'email' in request.auth.token &&
+        request.auth.token.email is string &&
+        request.auth.token.email.lower() in [
+          '2k24.csai1a.2412094@gmail.com',
+          'visionvibes14589@gmail.com',
+          'admin@smartpds.gov.in',
+          'hackathonnn123@gmail.com',
+          'aglpihu2006@gmail.com'
+        ];
+    }
+
+    // Role Resolution: Check bootstrap admin email or authoritative user document role
+    function isAdmin() {
+      return isSignedIn() && (
+        isBootstrapAdmin() ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == 'Administrator')
+      );
+    }
+
+    function isWarehouseOperator() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == 'Warehouse Operator';
+    }
+
+    function isWarehouseOrAdmin() {
+      return isAdmin() || isWarehouseOperator();
+    }
+
+    function isDealer() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', '') == 'Ration Shop Dealer';
+    }
+
+    // Check if a Ration Shop Dealer is assigned to a specific Fair Price Shop ID or Name
+    function canDealerAccessFps(targetFpsId) {
+      return isDealer() && targetFpsId is string && targetFpsId != '' && (
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('fpsId', '') == targetFpsId ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('assignedFpsId', '') == targetFpsId ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('shopId', '') == targetFpsId ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('fpsName', '') == targetFpsId
+      );
+    }
+
+    function isValidUser(data) {
+      return data.id is string &&
+             data.id == request.auth.uid &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.email is string && data.email.size() > 0 && data.email.size() <= 150 &&
+             isValidRole(data.role);
+    }
+
+    function isValidBatchCreate(data) {
+      return data.id is string && isValidId(data.id) &&
+             data.commodity in ['Rice', 'Wheat', 'Sugar', 'Coarse Grains', 'Pulses'] &&
+             data.variety is string && data.variety.size() > 0 && data.variety.size() <= 80 &&
+             data.receivedDate is string && data.receivedDate.size() >= 8 && data.receivedDate.size() <= 12 &&
+             data.initialBags is number && data.initialBags > 0 &&
+             data.availableBags is number && data.availableBags > 0 &&
+             data.availableBags <= data.initialBags &&
+             data.bagWeightKg is number && data.bagWeightKg > 0 &&
+             data.totalReceivedQtl is number && data.totalReceivedQtl > 0 &&
+             data.availableQtl is number && data.availableQtl >= 0 &&
+             data.status in ['Eligible', 'Quarantined', 'Damaged', 'Exhausted'] &&
+             data.moisturePercentage is number && data.moisturePercentage >= 0;
+    }
+
+    function isValidBatchUpdate(incoming, existing) {
+      return incoming.get('id', existing.id) == existing.get('id', existing.id) &&
+             incoming.commodity == existing.commodity &&
+             incoming.receivedDate == existing.receivedDate &&
+             incoming.initialBags == existing.initialBags &&
+             incoming.availableBags is number && incoming.availableBags >= 0 &&
+             incoming.availableBags <= existing.initialBags &&
+             incoming.availableQtl is number && incoming.availableQtl >= 0 &&
+             incoming.status in ['Eligible', 'Quarantined', 'Damaged', 'Exhausted'];
+    }
+
+    function isValidInwardReceipt(data) {
+      return data.id is string && isValidId(data.id) &&
+             data.batchId is string && isValidId(data.batchId) &&
+             data.commodity in ['Rice', 'Wheat', 'Sugar', 'Coarse Grains', 'Pulses'] &&
+             data.variety is string && data.variety.size() > 0 && data.variety.size() <= 80 &&
+             data.initialBags is number && data.initialBags > 0 &&
+             data.bagWeightKg is number && data.bagWeightKg > 0 &&
+             data.totalReceivedQtl is number && data.totalReceivedQtl > 0 &&
+             data.status in ['Eligible', 'Quarantined'] &&
+             data.moisturePercentage is number && data.moisturePercentage >= 0;
+    }
+
+    function isValidDispatch(data) {
+      return data.challanNumber is string && data.challanNumber.size() > 0 && data.challanNumber.size() <= 60 &&
+             data.commodity in ['Rice', 'Wheat', 'Sugar', 'Coarse Grains', 'Pulses'] &&
+             data.totalBags is number && data.totalBags > 0 &&
+             data.totalQtl is number && data.totalQtl > 0 &&
+             data.destinationFpsId is string && data.destinationFpsId.size() > 0 && data.destinationFpsId.size() <= 60 &&
+             data.status in ['Dispatched', 'In Transit', 'Delivered'] &&
+             data.allocatedBatches is list && data.allocatedBatches.size() > 0;
+    }
+
+    function isValidStockTransaction(data) {
+      return data.id is string && isValidId(data.id) &&
+             data.action in ['RECEIPT', 'DISPATCH', 'STATUS_CHANGE', 'ADJUSTMENT'] &&
+             data.batchId is string &&
+             data.quantityBags is number && data.quantityBags > 0 &&
+             data.referenceId is string && data.referenceId.size() > 0;
+    }
+
+    function isValidAuditLog(data) {
+      return data.id is string && isValidId(data.id) &&
+             data.user is string && data.user.size() > 0 && data.user.size() <= 100 &&
+             data.action is string && data.action.size() > 0 && data.action.size() <= 60 &&
+             data.entity is string && data.entity.size() > 0 && data.entity.size() <= 60 &&
+             data.referenceId is string && data.referenceId.size() > 0 && data.referenceId.size() <= 100 &&
+             data.result in ['SUCCESS', 'WARNING', 'REJECTED'];
+    }
+
+    // 1. Users collection: Strictly private user account profiles
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      // Public self-registration CANNOT self-grant Administrator or Warehouse Operator role
+      // Regular users are strictly restricted to 'Ration Shop Dealer'; only an Administrator can provision or elevate higher roles
+      allow create: if isValidId(userId) && (
+        (isOwner(userId) && isValidUser(request.resource.data) && request.resource.data.role == 'Ration Shop Dealer') ||
+        (isAdmin() && isValidUser(request.resource.data))
+      );
+      // Users cannot elevate their own role; Administrators can adjust roles
+      allow update: if isValidId(userId) && isValidUser(request.resource.data) && (
+        (isOwner(userId) && request.resource.data.role == resource.data.role) ||
+        isAdmin()
+      );
+      allow delete: if false;
+    }
+
+    // 2. Commodities Master: Authoritative staple classifications & buffer norms
+    match /commodities/{commodityId} {
+      allow get: if isSignedIn() && isValidId(commodityId);
+      allow list: if isSignedIn();
+      allow create, update: if isAdmin() && isValidId(commodityId);
+      allow delete: if false;
+    }
+
+    // 3. Batches: Grain lots with receipt date and available bag counts
+    match /batches/{batchId} {
+      allow get: if isWarehouseOrAdmin() && isValidId(batchId);
+      allow list: if isWarehouseOrAdmin();
+      allow create: if isWarehouseOrAdmin() && isValidId(batchId) && isValidBatchCreate(request.resource.data);
+      // Updates must be authorized, preserve initial quantities, received date, commodity, and prevent negative stock
+      allow update: if isWarehouseOrAdmin() && isValidId(batchId) && isValidBatchUpdate(request.resource.data, resource.data);
+      allow delete: if false; // Inventory batches cannot be deleted; status is updated to 'Exhausted'
+    }
+
+    // 4. Inward Receipts: Gate intake weighbridge & QC certificates
+    match /inward_receipts/{receiptId} {
+      allow get: if isWarehouseOrAdmin() && isValidId(receiptId);
+      allow list: if isWarehouseOrAdmin();
+      allow create: if isWarehouseOrAdmin() && isValidId(receiptId) && isValidInwardReceipt(request.resource.data);
+      allow update, delete: if false; // Statutory inward receipts are immutable records
+    }
+
+    // 5. Dispatches: Form PDS-12 digital challans and transit gate passes
+    match /dispatches/{challanNumber} {
+      // Warehouse Operators and Admins can read all dispatches. Dealers can read only dispatches for their assigned shop.
+      allow get: if isValidId(challanNumber) && (
+        isWarehouseOrAdmin() || canDealerAccessFps(resource.data.destinationFpsId)
+      );
+      allow list: if isWarehouseOrAdmin() || (
+        isDealer() && canDealerAccessFps(resource.data.destinationFpsId)
+      );
+      // Only authorized Warehouse Operators or Administrators can issue official dispatches
+      allow create: if isWarehouseOrAdmin() && isValidId(challanNumber) && isValidDispatch(request.resource.data);
+      // Issued challans are statutory records: core allocation fields (bags, qtl, batches, vehicle, destination) are IMMUTABLE.
+      // Only transit status transitions (e.g. Dispatched -> In Transit -> Delivered) are permitted
+      allow update: if isWarehouseOrAdmin() && isValidId(challanNumber) && (
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'deliveredAt', 'receiptNotes', 'updatedAt']) &&
+        request.resource.data.status in ['Dispatched', 'In Transit', 'Delivered'] &&
+        request.resource.data.totalBags == resource.data.totalBags &&
+        request.resource.data.totalQtl == resource.data.totalQtl &&
+        request.resource.data.allocatedBatches == resource.data.allocatedBatches &&
+        request.resource.data.commodity == resource.data.commodity &&
+        request.resource.data.destinationFpsId == resource.data.destinationFpsId
+      );
+      allow delete: if false; // Statutory digital challans cannot be deleted once issued
+    }
+
+    // 6. Fair Price Shops (Ration Shops)
+    match /fair_price_shops/{shopId} {
+      // Operators and Admins can view all shops. Dealers can view only their assigned shop document.
+      allow get: if isValidId(shopId) && (isWarehouseOrAdmin() || canDealerAccessFps(shopId));
+      allow list: if isWarehouseOrAdmin() || (isDealer() && canDealerAccessFps(resource.data.id));
+      allow create, update: if isAdmin() && isValidId(shopId);
+      allow delete: if false;
+    }
+
+    // 7. Stock Transactions: Granular movement audit ledger
+    match /stock_transactions/{transactionId} {
+      allow get: if isWarehouseOrAdmin() && isValidId(transactionId);
+      allow list: if isWarehouseOrAdmin();
+      allow create: if isWarehouseOrAdmin() && isValidId(transactionId) && isValidStockTransaction(request.resource.data);
+      allow update, delete: if false; // Ledger entries are strictly immutable
+    }
+
+    // 8. Audit Logs: Append-only compliance and vigilance ledger
+    match /audit_logs/{logId} {
+      allow get: if isWarehouseOrAdmin() && isValidId(logId);
+      allow list: if isWarehouseOrAdmin();
+      allow create: if isSignedIn() && isValidId(logId) && isValidAuditLog(request.resource.data);
+      allow update, delete: if false; // Append-only immutable log
+    }
+
+    // 9. Delivery Tracking: Telematics milestones and e-PoS delivery verification
+    match /delivery_tracking/{trackId} {
+      allow get: if isValidId(trackId) && (
+        isWarehouseOrAdmin() || canDealerAccessFps(resource.data.destinationFps)
+      );
+      allow list: if isWarehouseOrAdmin() || (
+        isDealer() && canDealerAccessFps(resource.data.destinationFps)
+      );
+      allow create: if isWarehouseOrAdmin() && isValidId(trackId);
+      allow update: if isValidId(trackId) && (
+        isWarehouseOrAdmin() ||
+        (isDealer() && canDealerAccessFps(resource.data.destinationFps) &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['otpVerified', 'currentMilestone', 'status', 'transitUpdates', 'updatedAt']))
+      );
+      allow delete: if false;
+    }
+
+    // 10. Returns & Discrepancies: Transit shortages, damaged gunnies, and moisture variances
+    match /returns/{returnId} {
+      allow get: if isValidId(returnId) && (
+        isWarehouseOrAdmin() || canDealerAccessFps(resource.data.fpsName)
+      );
+      allow list: if isWarehouseOrAdmin() || (
+        isDealer() && canDealerAccessFps(resource.data.fpsName)
+      );
+      allow create: if isValidId(returnId) && (
+        isWarehouseOrAdmin() ||
+        (isDealer() && canDealerAccessFps(request.resource.data.fpsName))
+      ) && request.resource.data.dispatchedBags >= 0 && request.resource.data.receivedBags >= 0;
+      allow update: if isWarehouseOrAdmin() && isValidId(returnId);
+      allow delete: if false;
+    }
+
+    // 11. Reconciliations: Physical stock counts and variance reports
+    match /reconciliations/{recId} {
+      allow get: if isWarehouseOrAdmin() && isValidId(recId);
+      allow list: if isWarehouseOrAdmin();
+      allow create: if isWarehouseOrAdmin() && isValidId(recId);
+      allow update: if isAdmin() && isValidId(recId); // Physical count adjustments require Administrator sign-off
+      allow delete: if false;
+    }
+
+    // 12. Approval Requests: Multi-tier manager sign-off workflows
+    match /approval_requests/{requestId} {
+      allow get: if isWarehouseOrAdmin() && isValidId(requestId);
+      allow list: if isWarehouseOrAdmin();
+      allow create: if isWarehouseOrAdmin() && isValidId(requestId);
+      allow update: if isAdmin() && isValidId(requestId); // Only Administrators can approve or reject
+      allow delete: if false;
+    }
+
+    // 13. FIFO Exceptions: Overrides requiring manager digital sign-off
+    match /fifo_exceptions/{excId} {
+      allow get: if isWarehouseOrAdmin() && isValidId(excId);
+      allow list: if isWarehouseOrAdmin();
+      allow create: if isWarehouseOrAdmin() && isValidId(excId);
+      allow update: if isAdmin() && isValidId(excId); // Only Administrators can approve exceptions
+      allow delete: if false;
+    }
+
+    // 14. Depot Settings: Global operational thresholds and rules
+    match /depot_settings/{settingsId} {
+      allow get: if isSignedIn() && isValidId(settingsId);
+      allow list: if isSignedIn();
+      allow create, update: if isAdmin() && isValidId(settingsId);
+      allow delete: if false;
+    }
+
+    // 15. Diagnostic Connectivity Test collection
+    match /test/{testId} {
+      allow get: if isValidId(testId);
+      allow list: if false;
+      allow write: if isSignedIn() && isValidId(testId);
+    }
+  }
+}
